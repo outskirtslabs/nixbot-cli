@@ -265,6 +265,48 @@
                     (or (failed-attrs-text attributes) "")))
     (format-build data mode)))
 
+;; --- config ---
+
+(defn mask-token [token]
+  (let [token (text token)]
+    (if (> (count token) 10)
+      (str (subs token 0 10) "…")
+      token)))
+
+(def ^:private source-descriptions
+  {:url           {:flag   "--base-url"
+                   :env    "NIXBOT_URL (environment)"
+                   :dotenv "NIXBOT_URL (.env)"
+                   :config "config.edn :url"}
+   :token         {:env            "NIXBOT_API_TOKEN (environment)"
+                   :dotenv         "NIXBOT_API_TOKEN (.env)"
+                   :env-command    "NIXBOT_API_TOKEN_COMMAND (environment)"
+                   :dotenv-command "NIXBOT_API_TOKEN_COMMAND (.env)"
+                   :config         "config.edn :token"
+                   :config-command "config.edn :token-command"}
+   :default-forge {:env     "NIXBOT_CLI_DEFAULT_FORGE (environment)"
+                   :dotenv  "NIXBOT_CLI_DEFAULT_FORGE (.env)"
+                   :config  "config.edn :default-forge"
+                   :default "built-in default"}})
+
+(defn- config-setting-line [label setting-key resolved]
+  (if resolved
+    (str label (:value resolved)
+         "  (from " (get-in source-descriptions [setting-key (:source resolved)]
+                            (text (:source resolved)))
+         ")")
+    (str label "(not set)")))
+
+(defn format-config [{:keys [config-file] :as data} output-format]
+  (or (machine data output-format)
+      (str/join "\n"
+                [(str "Config file: " (:path config-file)
+                      (when-not (:exists config-file) " (not found)"))
+                 ""
+                 (config-setting-line "url:           " :url (:url data))
+                 (config-setting-line "token:         " :token (:token data))
+                 (config-setting-line "default-forge: " :default-forge (:default-forge data))])))
+
 ;; --- control actions ---
 
 (defn format-action [result output-format]

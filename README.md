@@ -46,6 +46,26 @@ export NIXBOT_API_TOKEN_COMMAND='op item get "Nixbot" --reveal --fields NIXBOT_A
 
 Both variables are also read from a `.env` file in the current directory.
 
+Alternatively, put the settings in `$XDG_CONFIG_HOME/nixbot-cli/config.edn` (all keys optional; environment variables take precedence over the config file):
+
+```clojure
+{:url           "https://nixbot.example.com"
+ :token         "bnix_..."
+ ;; or, instead of :token, a command printing the token to stdout:
+ :token-command "op item get Nixbot --reveal --fields password"
+ :default-forge "github"}
+```
+
+`nixbot-cli config` shows the effective settings and where each one came from:
+
+```text
+Config file: /home/casey/.config/nixbot-cli/config.edn
+
+url:           https://ci.outskirtslabs.com  (from config.edn :url)
+token:         bnix_JQjxN…  (from NIXBOT_API_TOKEN (environment))
+default-forge: github  (from built-in default)
+```
+
 ## Install
 
 <details>

@@ -59,6 +59,10 @@
   (is (= :disable (:command (core/parse-command ["disable"]))))
   (is (= :cancel (:command (core/parse-command ["cancel" "3"])))))
 
+(deftest parse-command-accepts-config
+  (is (= :config (:command (core/parse-command ["config"]))))
+  (is (= :json (:format (core/parse-command ["config" "--json"])))))
+
 (deftest parse-command-rejects-unknown-commands
   (is (thrown-with-msg? Exception #"unknown command"
                         (core/parse-command ["bogus"]))))

@@ -1,6 +1,7 @@
 (ns nixbot-cli.core
   (:require
    [babashka.cli :as cli]
+   [babashka.fs :as fs]
    [clojure.string :as str]
    [nixbot-cli.api :as api]
    [nixbot-cli.auth :as auth]
@@ -66,7 +67,7 @@
 
 (def commands
   #{"help" "repos" "builds" "queue" "build" "failures" "attr" "logs"
-    "watch" "restart" "cancel" "enable" "disable"})
+    "watch" "restart" "cancel" "enable" "disable" "config"})
 
 (def value-options
   #{"--base-url" "--format" "--repo" "-R" "--status" "-s" "--branch"
@@ -143,6 +144,7 @@
                  (assoc opts :command :cancel :number number))
       "enable" (assoc opts :command :enable)
       "disable" (assoc opts :command :disable)
+      "config" (assoc opts :command :config)
       (usage-error (str "unknown command: " command)))))
 
 (defn help-text []
@@ -163,6 +165,7 @@
     "  nixbot-cli cancel <number> [-R REPO]"
     "  nixbot-cli enable [-R REPO]"
     "  nixbot-cli disable [-R REPO]"
+    "  nixbot-cli config"
     ""
     "REPO is [FORGE/]OWNER/REPO; without -R the repo is detected from the local"
     "git checkout. The default forge is github (override: NIXBOT_CLI_DEFAULT_FORGE)."
@@ -172,13 +175,21 @@
     "  NIXBOT_API_TOKEN          API token"
     "  NIXBOT_API_TOKEN_COMMAND  Command printing the API token to stdout"
     ""
+    "Configuration file ($XDG_CONFIG_HOME/nixbot-cli/config.edn, all keys optional;"
+    "environment variables take precedence):"
+    "  {:url           \"https://nixbot.example.com\""
+    "   :token         \"bnix_...\""
+    "   :token-command \"pass show nixbot-token\""
+    "   :default-forge \"github\"}"
+    ""
     "Options:"
     (cli/format-opts cli-config)]))
 
 (defn- client [opts]
   (let [base-url (auth/resolve-base-url opts)]
     (when (str/blank? base-url)
-      (usage-error "Nixbot instance URL is required. Set NIXBOT_URL or pass --base-url."))
+      (usage-error (str "Nixbot instance URL is required. Set NIXBOT_URL, pass --base-url, "
+                        "or put :url in " (auth/config-file-path) ".")))
     {:base-url base-url
      :token    (auth/resolve-token opts)}))
 
@@ -250,6 +261,15 @@
 (defn execute! [parsed]
   (case (:command parsed)
     :help (do (println (help-text)) nil)
+    :config (let [path (str (or (:config-path parsed) (auth/config-file-path)))
+                  data {:config-file   {:path   path
+                                        :exists (boolean (fs/regular-file? path))}
+                        :url           (auth/resolve-base-url* parsed)
+                        :token         (some-> (auth/resolve-token* parsed)
+                                               (update :value fmt/mask-token))
+                        :default-forge (auth/resolve-default-forge* parsed)}]
+              (println (fmt/format-config data (:format parsed)))
+              data)
     :repos (let [client (client parsed)
                  repos  (api/fetch-repos! client)]
              (println (fmt/format-repos repos (:format parsed)))

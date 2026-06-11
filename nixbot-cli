@@ -438,6 +438,48 @@
                     (or (failed-attrs-text attributes) "")))
     (format-build data mode)))
 
+;; --- config ---
+
+(defn mask-token [token]
+  (let [token (text token)]
+    (if (> (count token) 10)
+      (str (subs token 0 10) "…")
+      token)))
+
+(def ^:private source-descriptions
+  {:url           {:flag   "--base-url"
+                   :env    "NIXBOT_URL (environment)"
+                   :dotenv "NIXBOT_URL (.env)"
+                   :config "config.edn :url"}
+   :token         {:env            "NIXBOT_API_TOKEN (environment)"
+                   :dotenv         "NIXBOT_API_TOKEN (.env)"
+                   :env-command    "NIXBOT_API_TOKEN_COMMAND (environment)"
+                   :dotenv-command "NIXBOT_API_TOKEN_COMMAND (.env)"
+                   :config         "config.edn :token"
+                   :config-command "config.edn :token-command"}
+   :default-forge {:env     "NIXBOT_CLI_DEFAULT_FORGE (environment)"
+                   :dotenv  "NIXBOT_CLI_DEFAULT_FORGE (.env)"
+                   :config  "config.edn :default-forge"
+                   :default "built-in default"}})
+
+(defn- config-setting-line [label setting-key resolved]
+  (if resolved
+    (str label (:value resolved)
+         "  (from " (get-in source-descriptions [setting-key (:source resolved)]
+                            (text (:source resolved)))
+         ")")
+    (str label "(not set)")))
+
+(defn format-config [{:keys [config-file] :as data} output-format]
+  (or (machine data output-format)
+      (str/join "\n"
+                [(str "Config file: " (:path config-file)
+                      (when-not (:exists config-file) " (not found)"))
+                 ""
+                 (config-setting-line "url:           " :url (:url data))
+                 (config-setting-line "token:         " :token (:token data))
+                 (config-setting-line "default-forge: " :default-forge (:default-forge data))])))
+
 ;; --- control actions ---
 
 (defn format-action [result output-format]
@@ -452,12 +494,15 @@
   (:require
    [babashka.fs :as fs]
    [babashka.process :as p]
+   [clojure.edn :as edn]
    [clojure.string :as str]))
 
 (def token-env-var "NIXBOT_API_TOKEN")
 (def token-command-env-var "NIXBOT_API_TOKEN_COMMAND")
 (def url-env-var "NIXBOT_URL")
 (def default-forge-env-var "NIXBOT_CLI_DEFAULT_FORGE")
+
+(def config-keys [:url :token :token-command :default-forge])
 
 (defn- non-blank [s]
   (when-not (str/blank? s)
@@ -492,11 +537,41 @@
           (into {}))
      {})))
 
-(defn- env-and-dotenv [opts]
+(defn config-file-path
+  "Default config file location, honoring XDG_CONFIG_HOME."
+  []
+  (str (fs/xdg-config-home "nixbot-cli") "/config.edn"))
+
+(defn read-config-file
+  "Parses the config.edn at `path`. Missing file yields {}. The file must
+  contain an EDN map; only string values for the known keys are kept."
+  [path]
+  (if (fs/regular-file? path)
+    (let [data (try
+                 (edn/read-string (slurp (str path)))
+                 (catch Exception e
+                   (throw (ex-info (str "Could not parse " path ": " (ex-message e))
+                                   {:type :nixbot-cli.auth/invalid-config
+                                    :path (str path)}))))]
+      (when-not (map? data)
+        (throw (ex-info (str path " must contain an EDN map")
+                        {:type :nixbot-cli.auth/invalid-config
+                         :path (str path)})))
+      (into {}
+            (for [k     config-keys
+                  :let  [v (get data k)]
+                  :when (and (string? v) (not (str/blank? v)))]
+              [k v])))
+    {}))
+
+(defn- settings-sources [opts]
   {:env    (if (contains? opts :env) (:env opts) (System/getenv))
    :dotenv (if (contains? opts :dotenv)
              (:dotenv opts)
-             (dotenv-map (or (:dotenv-path opts) ".env")))})
+             (dotenv-map (or (:dotenv-path opts) ".env")))
+   :config (if (contains? opts :config)
+             (:config opts)
+             (read-config-file (or (:config-path opts) (config-file-path))))})
 
 (defn- run-token-command [opts command]
   (let [out (if-let [runner (:command-runner opts)]
@@ -511,32 +586,66 @@
                 out))]
     (non-blank (str/trim (or out "")))))
 
-(defn resolve-token
-  "Resolves the API token: NIXBOT_API_TOKEN value first, then the output
-  of NIXBOT_API_TOKEN_COMMAND. Both are also read from a local .env file."
-  [opts]
-  (let [{:keys [env dotenv]} (env-and-dotenv opts)
-        command              (or (non-blank (get env token-command-env-var))
-                                 (non-blank (get dotenv token-command-env-var)))]
-    (or (non-blank (get env token-env-var))
-        (non-blank (get dotenv token-env-var))
-        (some->> command (run-token-command opts)))))
+(defn- found [value source]
+  (when value
+    {:value value :source source}))
 
-(defn resolve-base-url
-  "Resolves the Nixbot instance URL: --base-url, then NIXBOT_URL (env or .env)."
+(defn resolve-token*
+  "Resolves the API token and where it came from. Order: NIXBOT_API_TOKEN,
+  NIXBOT_API_TOKEN_COMMAND (env, then .env for both), then :token and
+  :token-command from config.edn."
   [opts]
-  (let [{:keys [env dotenv]} (env-and-dotenv opts)]
-    (or (non-blank (:base-url opts))
-        (non-blank (get env url-env-var))
-        (non-blank (get dotenv url-env-var)))))
+  (let [{:keys [env dotenv config]} (settings-sources opts)]
+    (or (found (non-blank (get env token-env-var)) :env)
+        (found (non-blank (get dotenv token-env-var)) :dotenv)
+        (found (some->> (non-blank (get env token-command-env-var))
+                        (run-token-command opts))
+               :env-command)
+        (found (some->> (non-blank (get dotenv token-command-env-var))
+                        (run-token-command opts))
+               :dotenv-command)
+        (found (non-blank (:token config)) :config)
+        (found (some->> (non-blank (:token-command config))
+                        (run-token-command opts))
+               :config-command))))
 
-(defn resolve-default-forge
-  "Resolves the default forge: NIXBOT_CLI_DEFAULT_FORGE (env or .env), else github."
+(defn resolve-token [opts]
+  (:value (resolve-token* opts)))
+
+(defn- ensure-scheme
+  "A bare domain like ci.example.com gets an https:// prefix."
+  [url]
+  (when url
+    (if (str/includes? url "://")
+      url
+      (str "https://" url))))
+
+(defn resolve-base-url*
+  "Resolves the Nixbot instance URL and where it came from: --base-url,
+  NIXBOT_URL (env, then .env), then :url from config.edn."
   [opts]
-  (let [{:keys [env dotenv]} (env-and-dotenv opts)]
-    (or (non-blank (get env default-forge-env-var))
-        (non-blank (get dotenv default-forge-env-var))
-        "github")))
+  (let [{:keys [env dotenv config]} (settings-sources opts)
+        resolved                    (or (found (non-blank (:base-url opts)) :flag)
+                                        (found (non-blank (get env url-env-var)) :env)
+                                        (found (non-blank (get dotenv url-env-var)) :dotenv)
+                                        (found (non-blank (:url config)) :config))]
+    (some-> resolved (update :value ensure-scheme))))
+
+(defn resolve-base-url [opts]
+  (:value (resolve-base-url* opts)))
+
+(defn resolve-default-forge*
+  "Resolves the default forge and where it came from: NIXBOT_CLI_DEFAULT_FORGE
+  (env, then .env), then :default-forge from config.edn, else github."
+  [opts]
+  (let [{:keys [env dotenv config]} (settings-sources opts)]
+    (or (found (non-blank (get env default-forge-env-var)) :env)
+        (found (non-blank (get dotenv default-forge-env-var)) :dotenv)
+        (found (non-blank (:default-forge config)) :config)
+        (found "github" :default))))
+
+(defn resolve-default-forge [opts]
+  (:value (resolve-default-forge* opts)))
 (ns nixbot-cli.api
   (:require
    [babashka.http-client :as http]
@@ -682,6 +791,7 @@
 (ns nixbot-cli.core
   (:require
    [babashka.cli :as cli]
+   [babashka.fs :as fs]
    [clojure.string :as str]
    [nixbot-cli.api :as api]
    [nixbot-cli.auth :as auth]
@@ -747,7 +857,7 @@
 
 (def commands
   #{"help" "repos" "builds" "queue" "build" "failures" "attr" "logs"
-    "watch" "restart" "cancel" "enable" "disable"})
+    "watch" "restart" "cancel" "enable" "disable" "config"})
 
 (def value-options
   #{"--base-url" "--format" "--repo" "-R" "--status" "-s" "--branch"
@@ -824,6 +934,7 @@
                  (assoc opts :command :cancel :number number))
       "enable" (assoc opts :command :enable)
       "disable" (assoc opts :command :disable)
+      "config" (assoc opts :command :config)
       (usage-error (str "unknown command: " command)))))
 
 (defn help-text []
@@ -844,6 +955,7 @@
     "  nixbot-cli cancel <number> [-R REPO]"
     "  nixbot-cli enable [-R REPO]"
     "  nixbot-cli disable [-R REPO]"
+    "  nixbot-cli config"
     ""
     "REPO is [FORGE/]OWNER/REPO; without -R the repo is detected from the local"
     "git checkout. The default forge is github (override: NIXBOT_CLI_DEFAULT_FORGE)."
@@ -853,13 +965,21 @@
     "  NIXBOT_API_TOKEN          API token"
     "  NIXBOT_API_TOKEN_COMMAND  Command printing the API token to stdout"
     ""
+    "Configuration file ($XDG_CONFIG_HOME/nixbot-cli/config.edn, all keys optional;"
+    "environment variables take precedence):"
+    "  {:url           \"https://nixbot.example.com\""
+    "   :token         \"bnix_...\""
+    "   :token-command \"pass show nixbot-token\""
+    "   :default-forge \"github\"}"
+    ""
     "Options:"
     (cli/format-opts cli-config)]))
 
 (defn- client [opts]
   (let [base-url (auth/resolve-base-url opts)]
     (when (str/blank? base-url)
-      (usage-error "Nixbot instance URL is required. Set NIXBOT_URL or pass --base-url."))
+      (usage-error (str "Nixbot instance URL is required. Set NIXBOT_URL, pass --base-url, "
+                        "or put :url in " (auth/config-file-path) ".")))
     {:base-url base-url
      :token    (auth/resolve-token opts)}))
 
@@ -931,6 +1051,15 @@
 (defn execute! [parsed]
   (case (:command parsed)
     :help (do (println (help-text)) nil)
+    :config (let [path (str (or (:config-path parsed) (auth/config-file-path)))
+                  data {:config-file   {:path   path
+                                        :exists (boolean (fs/regular-file? path))}
+                        :url           (auth/resolve-base-url* parsed)
+                        :token         (some-> (auth/resolve-token* parsed)
+                                               (update :value fmt/mask-token))
+                        :default-forge (auth/resolve-default-forge* parsed)}]
+              (println (fmt/format-config data (:format parsed)))
+              data)
     :repos (let [client (client parsed)
                  repos  (api/fetch-repos! client)]
              (println (fmt/format-repos repos (:format parsed)))
