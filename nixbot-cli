@@ -1,0 +1,955 @@
+#!/usr/bin/env bb
+(ns nixbot-cli.repo
+  (:require
+   [babashka.fs :as fs]
+   [babashka.process :as p]
+   [clojure.string :as str]))
+
+(def host->forge
+  {"github.com" "github"
+   "gitlab.com" "gitlab"})
+
+(defn- repo-map [forge owner name]
+  {:forge forge
+   :owner owner
+   :name  name
+   :slug  (str forge "/" owner "/" name)})
+
+(defn parse-repo
+  "Parses a --repo argument: FORGE/OWNER/REPO or OWNER/REPO (using `default-forge`)."
+  [repo default-forge]
+  (let [parts (->> (str/split (str/trim (or repo "")) #"/")
+                   (remove str/blank?)
+                   vec)]
+    (case (count parts)
+      2 (repo-map default-forge (first parts) (second parts))
+      3 (repo-map (get host->forge (first parts) (first parts))
+                  (second parts)
+                  (nth parts 2))
+      (throw (ex-info "Repository must use OWNER/REPO or FORGE/OWNER/REPO format"
+                      {:type :nixbot-cli.repo/invalid-repo
+                       :repo repo})))))
+
+(defn remote-url->repo
+  "Parses a git remote URL (ssh or https) into a repo map. The forge is
+  derived from the host when known, otherwise `default-forge` is used."
+  [remote-url default-forge]
+  (let [url          (-> (str/trim (or remote-url ""))
+                         (str/replace #"\.git$" "")
+                         (str/replace #"^(ssh://)?git@" "")
+                         (str/replace #"^https?://" "")
+                         (str/replace #":" "/"))
+        parts        (->> (str/split url #"/")
+                          (remove str/blank?)
+                          vec)
+        host         (first parts)
+        [owner name] (take-last 2 parts)]
+    (if (and host owner name (>= (count parts) 3))
+      (repo-map (get host->forge host default-forge) owner name)
+      (throw (ex-info (str "Could not parse git remote URL: " remote-url)
+                      {:type       :nixbot-cli.repo/invalid-remote
+                       :remote-url remote-url})))))
+
+(defn find-git-dir
+  "Walks up from `start-dir` looking for a directory containing .git.
+  Returns the containing directory as a string, or nil."
+  [start-dir]
+  (loop [dir (fs/absolutize start-dir)]
+    (cond
+      (nil? dir) nil
+      (fs/exists? (fs/path dir ".git")) (str dir)
+      :else (recur (fs/parent dir)))))
+
+(defn- git-remote-url [dir]
+  (let [{:keys [exit out]} (p/sh {:out :string :err :string :continue true}
+                                 "git" "-C" dir "remote" "get-url" "origin")]
+    (when (zero? exit)
+      (str/trim out))))
+
+(defn current-repo
+  "Determines the repo from the git checkout at (or above) the current directory."
+  [{:keys [default-forge start-dir git-remote-fn]
+    :or   {start-dir "."}}]
+  (let [git-dir (find-git-dir start-dir)
+        remote  (when git-dir
+                  ((or git-remote-fn git-remote-url) git-dir))]
+    (if (str/blank? remote)
+      (throw (ex-info "Could not determine repository from git. Pass -R [FORGE/]OWNER/REPO."
+                      {:type :nixbot-cli.repo/missing-repo}))
+      (remote-url->repo remote default-forge))))
+
+(defn resolve-repo
+  "Resolves the target repo from a --repo argument or the local git checkout."
+  ([repo-arg]
+   (resolve-repo repo-arg {:default-forge "github"}))
+  ([repo-arg opts]
+   (if (str/blank? repo-arg)
+     (current-repo opts)
+     (parse-repo repo-arg (:default-forge opts)))))
+(ns nixbot-cli.builds
+  (:require
+   [clojure.string :as str]))
+
+;; Build statuses: pending | evaluating | building | succeeded | failed | cancelled
+(def terminal-build-statuses #{"succeeded" "failed" "cancelled"})
+
+(def status-aliases
+  {"success"  "succeeded"
+   "failure"  "failed"
+   "canceled" "cancelled"
+   "running"  "building"
+   "queued"   "pending"})
+
+(def known-statuses
+  #{"pending" "evaluating" "building" "succeeded" "failed" "cancelled"})
+
+(defn normalize-status
+  "Maps a user-supplied --status value onto a Nixbot build status."
+  [status]
+  (when-not (str/blank? status)
+    (let [status (str/lower-case (str/trim status))
+          status (get status-aliases status status)]
+      (when-not (contains? known-statuses status)
+        (throw (ex-info (str "Unsupported status: " status
+                             " (expected one of " (str/join ", " (sort known-statuses)) ")")
+                        {:type   :nixbot-cli.builds/unsupported-status
+                         :status status})))
+      status)))
+
+(defn field [m k]
+  (cond
+    (contains? m k) (get m k)
+    (contains? m (name k)) (get m (name k))
+    :else nil))
+
+;; Attribute statuses: pending | building | succeeded | failed | cancelled
+;; | skipped_local | dependency_failed | cached_failure | failed_eval
+(def attr-status->group
+  {"succeeded"         :succeeded
+   "skipped_local"     :succeeded
+   "failed"            :failed
+   "dependency_failed" :failed
+   "cached_failure"    :failed
+   "failed_eval"       :failed
+   "pending"           :pending
+   "building"          :pending
+   "cancelled"         :cancelled})
+
+(defn attr-group [attribute]
+  (get attr-status->group (str (field attribute :status)) :pending))
+
+(defn failed-attr? [attribute]
+  (= :failed (attr-group attribute)))
+
+(defn summarize-attrs
+  "Counts a build's attributes: {:succeeded n :failed n :pending n :cancelled n}."
+  [attributes]
+  (reduce (fn [acc attribute]
+            (update acc (attr-group attribute) (fnil inc 0)))
+          {:succeeded 0 :failed 0 :pending 0 :cancelled 0}
+          attributes))
+
+(defn terminal?
+  "True when the build reached a final status."
+  [build]
+  (contains? terminal-build-statuses (str (field build :status))))
+
+(defn exit-code [build]
+  (if (= "succeeded" (str (field build :status)))
+    0
+    1))
+
+(defn fetch-up-to
+  "Fetches builds page by page via `fetch-page` (page-number -> BuildPage)
+  until `limit` items are collected or pages run out."
+  [fetch-page limit]
+  (loop [page  1
+         items []]
+    (let [resp       (fetch-page page)
+          page-items (vec (or (field resp :items) []))
+          items      (into items page-items)]
+      (if (and (field resp :has_next) (< (count items) limit) (seq page-items))
+        (recur (inc page) items)
+        (vec (take limit items))))))
+(ns nixbot-cli.format
+  (:require
+   [cheshire.core :as json]
+   [clojure.string :as str]
+   [nixbot-cli.builds :as builds]))
+
+(def field builds/field)
+
+(defn- text [x]
+  (cond
+    (nil? x) ""
+    (keyword? x) (name x)
+    :else (str x)))
+
+(defn short-commit [commit]
+  (let [commit (text commit)]
+    (subs commit 0 (min 8 (count commit)))))
+
+(defn status-label [status]
+  (let [status (text status)]
+    (str (case status
+           ("succeeded" "skipped_local") "[OK]"
+           ("failed" "dependency_failed" "cached_failure" "failed_eval") "[FAIL]"
+           ("pending" "evaluating" "building") "⏳"
+           "cancelled" "[CANCELLED]"
+           "[UNKNOWN]")
+         " " status)))
+
+(defn- machine [data output-format]
+  (case output-format
+    :json (json/generate-string data)
+    :edn (pr-str data)
+    nil))
+
+(defn- labeled-lines
+  "`label` on the first line, continuation lines aligned under it."
+  [label s]
+  (let [lines  (str/split-lines (str/trim (text s)))
+        indent (apply str (repeat (count label) " "))]
+    (cons (str label (first lines))
+          (map #(str indent %) (rest lines)))))
+
+(defn- error-excerpt [err]
+  (let [lines (str/split-lines (str/trim (text err)))
+        tail  (take-last 3 lines)]
+    (cond->> tail
+      (> (count lines) 3) (cons "…"))))
+
+(defn- counts-text [{:keys [succeeded failed pending cancelled]}]
+  (str succeeded " succeeded, " failed " failed, "
+       pending " pending, " cancelled " cancelled"))
+
+;; --- repos ---
+
+(defn- repo-row [repo]
+  (str (field repo :forge) "/" (field repo :owner) "/" (field repo :name)
+       "  " (if (field repo :enabled) "enabled" "disabled")
+       "  " (field repo :default_branch)
+       "  " (field repo :url)))
+
+(defn format-repos [repos output-format]
+  (or (machine repos output-format)
+      (if (seq repos)
+        (str/join "\n" (map repo-row repos))
+        "No repos found")))
+
+;; --- builds list ---
+
+(defn- build-row [build]
+  (str "#" (field build :number)
+       "  " (status-label (field build :status))
+       "  " (field build :branch)
+       "  " (short-commit (field build :commit_sha))
+       (when-let [pr (field build :pr_number)] (str "  PR#" pr))
+       "  " (field build :created_at)))
+
+(defn format-builds [{:keys [repo items]} output-format]
+  (or (machine {:repo (:slug repo) :items items} output-format)
+      (if (seq items)
+        (str/join "\n"
+                  (cons (str "Builds for " (:slug repo))
+                        (map build-row items)))
+        (str "No builds found for " (:slug repo)))))
+
+;; --- queue ---
+
+(defn- queue-row [entry]
+  (str (if-let [pos (field entry :queue_position)] (str pos ".") "*")
+       "  " (field entry :forge) "/" (field entry :owner) "/" (field entry :project_name)
+       "  #" (field entry :number)
+       "  " (status-label (field entry :status))
+       "  " (field entry :branch)
+       "  " (short-commit (field entry :commit_sha))))
+
+(defn format-queue [entries output-format]
+  (or (machine entries output-format)
+      (if (seq entries)
+        (str/join "\n"
+                  (cons "Build queue (* = running):"
+                        (map queue-row entries)))
+        "Queue is empty")))
+
+;; --- build detail ---
+
+(defn- eval-warning-lines [warnings]
+  (when (seq warnings)
+    (cons "Eval warnings:"
+          (map (fn [w]
+                 (str "  [" (field w :level) "] " (field w :message)
+                      (let [n (field w :count)]
+                        (when (and n (> n 1)) (str " (x" n ")")))))
+               warnings))))
+
+(defn- failed-attr-lines [repo build attributes]
+  (let [failed (filter builds/failed-attr? attributes)]
+    (when (seq failed)
+      (concat ["" "Failed attributes:"]
+              (mapcat (fn [attribute]
+                        (concat
+                         [(str "  • " (field attribute :attr)
+                               " (" (or (field attribute :system) "unknown") "): "
+                               (status-label (field attribute :status)))]
+                         (when-let [err (field attribute :error)]
+                           (map #(str "    " %) (error-excerpt err)))
+                         [(str "    Logs: nixbot-cli logs " (field build :number)
+                               " '" (field attribute :attr) "'"
+                               " -R " (:slug repo))]))
+                      failed)))))
+
+(defn- format-build-human [{:keys [repo build attributes]}]
+  (let [counts (builds/summarize-attrs attributes)]
+    (str/join "\n"
+              (concat
+               [(str "# Build #" (field build :number) " for " (:slug repo))
+                ""
+                (str "Status: " (status-label (field build :status)))
+                (str "Branch: " (field build :branch)
+                     (when-let [pr (field build :pr_number)] (str " (PR#" pr ")")))
+                (str "Commit: " (field build :commit_sha))
+                (str "Created: " (field build :created_at))
+                (str "Finished: " (or (field build :finished_at) "-"))]
+               (when-let [err (field build :error)]
+                 (labeled-lines "Error: " err))
+               (eval-warning-lines (field build :eval_warnings))
+               [""
+                "## Summary"
+                (str "- [OK] Succeeded: " (:succeeded counts))
+                (str "- [FAIL] Failed: " (:failed counts))
+                (str "- ⏳ Pending: " (:pending counts))
+                (str "- [CANCELLED] Cancelled: " (:cancelled counts))]
+               (failed-attr-lines repo build attributes)))))
+
+(defn- format-build-plain [{:keys [repo build attributes]}]
+  (let [counts (builds/summarize-attrs attributes)]
+    (str/join "\n"
+              (concat
+               [(str "Build #" (field build :number) " for " (:slug repo))
+                (str "Status: " (text (field build :status)))
+                (str "Branch: " (field build :branch))
+                (str "Commit: " (field build :commit_sha))
+                (str "Summary: " (counts-text counts))
+                ""]
+               (map (fn [attribute]
+                      (str "  " (field attribute :attr)
+                           "  " (text (field attribute :status))
+                           " (" (or (field attribute :system) "unknown") ")"
+                           (when (field attribute :cached) "  cached")))
+                    attributes)))))
+
+(defn format-build [data output-format]
+  (or (machine (dissoc data :repo) output-format)
+      (case output-format
+        :plain (format-build-plain data)
+        (format-build-human data))))
+
+;; --- failures ---
+
+(defn- failure-lines [failure]
+  (concat
+   [(str "  • " (field failure :attr) ": " (status-label (field failure :status)))]
+   (when-let [err (field failure :error)]
+     (labeled-lines "    Error: " err))
+   (when-let [tail (field failure :log_tail)]
+     (cons "    --- log tail ---"
+           (map #(str "    " %) (str/split-lines tail))))))
+
+(defn format-failures [{:keys [repo number] :as data} output-format]
+  (let [summary (:summary data)]
+    (or (machine summary output-format)
+        (str/join "\n"
+                  (concat
+                   [(str "Failures for build #" number " (" (:slug repo) ")")
+                    (str "Status: " (status-label (field summary :status)))]
+                   (when-let [err (field summary :error)]
+                     (labeled-lines "Error: " err))
+                   (eval-warning-lines (field summary :eval_warnings))
+                   (let [failures (field summary :failures)]
+                     (if (seq failures)
+                       (cons "" (mapcat failure-lines failures))
+                       ["" "No failed attributes"])))))))
+
+;; --- attribute history ---
+
+(defn- history-row [entry]
+  (str "#" (field entry :build_number)
+       "  " (status-label (field entry :status))
+       "  " (field entry :branch)
+       "  " (short-commit (field entry :commit_sha))
+       (when (field entry :cached) "  cached")
+       "  " (field entry :build_created_at)))
+
+(defn format-attr-history [{:keys [repo attr entries]} output-format]
+  (or (machine entries output-format)
+      (if (seq entries)
+        (str/join "\n"
+                  (cons (str "History for " attr " in " (:slug repo))
+                        (map history-row entries)))
+        (str "No history for " attr " in " (:slug repo)))))
+
+;; --- watch ---
+
+(defn- failed-attrs-text [attributes]
+  (let [failed (filter builds/failed-attr? attributes)]
+    (when (seq failed)
+      (str " — failed: " (str/join ", " (map #(field % :attr) failed))))))
+
+(defn format-watch [{:keys [repo build attributes] :as data} mode]
+  (case mode
+    :compact (let [counts (builds/summarize-attrs attributes)]
+               (str "#" (field build :number)
+                    " " (:slug repo)
+                    " " (field build :branch)
+                    " " (text (field build :status))
+                    " — " (counts-text counts)
+                    (or (failed-attrs-text attributes) "")))
+    (format-build data mode)))
+
+;; --- control actions ---
+
+(defn format-action [result output-format]
+  (or (machine result output-format)
+      (str "Build #" (field result :number) ": " (field result :action) " requested")))
+
+(defn format-enabled [result output-format]
+  (or (machine result output-format)
+      (str "Repo " (field result :owner) "/" (field result :name) " is now "
+           (if (field result :enabled) "enabled" "disabled"))))
+(ns nixbot-cli.auth
+  (:require
+   [babashka.fs :as fs]
+   [babashka.process :as p]
+   [clojure.string :as str]))
+
+(def token-env-var "NIXBOT_API_TOKEN")
+(def token-command-env-var "NIXBOT_API_TOKEN_COMMAND")
+(def url-env-var "NIXBOT_URL")
+(def default-forge-env-var "NIXBOT_CLI_DEFAULT_FORGE")
+
+(defn- non-blank [s]
+  (when-not (str/blank? s)
+    s))
+
+(defn- strip-matching-quotes [s]
+  (let [s (str/trim (or s ""))]
+    (if (and (>= (count s) 2)
+             (or (and (= \" (first s)) (= \" (last s)))
+                 (and (= \' (first s)) (= \' (last s)))))
+      (subs s 1 (dec (count s)))
+      s)))
+
+(defn- parse-dotenv-line [line]
+  (let [line (str/trim line)
+        line (if (str/starts-with? line "export ")
+               (str/trim (subs line 7))
+               line)]
+    (when (and (not (str/blank? line))
+               (not (str/starts-with? line "#")))
+      (let [[k v] (str/split line #"=" 2)]
+        (when (and k v (re-matches #"[A-Za-z_][A-Za-z0-9_]*" (str/trim k)))
+          [(str/trim k) (strip-matching-quotes v)])))))
+
+(defn dotenv-map
+  ([]
+   (dotenv-map ".env"))
+  ([path]
+   (if (fs/regular-file? path)
+     (->> (fs/read-all-lines path)
+          (keep parse-dotenv-line)
+          (into {}))
+     {})))
+
+(defn- env-and-dotenv [opts]
+  {:env    (if (contains? opts :env) (:env opts) (System/getenv))
+   :dotenv (if (contains? opts :dotenv)
+             (:dotenv opts)
+             (dotenv-map (or (:dotenv-path opts) ".env")))})
+
+(defn- run-token-command [opts command]
+  (let [out (if-let [runner (:command-runner opts)]
+              (runner command)
+              (let [{:keys [exit out err]} (p/shell {:out :string :err :string :continue true} command)]
+                (when-not (zero? exit)
+                  (throw (ex-info (str token-command-env-var " failed: " (str/trim (or err "")))
+                                  {:type    :nixbot-cli.auth/token-command-failed
+                                   :command command
+                                   :exit    exit
+                                   :err     err})))
+                out))]
+    (non-blank (str/trim (or out "")))))
+
+(defn resolve-token
+  "Resolves the API token: NIXBOT_API_TOKEN value first, then the output
+  of NIXBOT_API_TOKEN_COMMAND. Both are also read from a local .env file."
+  [opts]
+  (let [{:keys [env dotenv]} (env-and-dotenv opts)
+        command              (or (non-blank (get env token-command-env-var))
+                                 (non-blank (get dotenv token-command-env-var)))]
+    (or (non-blank (get env token-env-var))
+        (non-blank (get dotenv token-env-var))
+        (some->> command (run-token-command opts)))))
+
+(defn resolve-base-url
+  "Resolves the Nixbot instance URL: --base-url, then NIXBOT_URL (env or .env)."
+  [opts]
+  (let [{:keys [env dotenv]} (env-and-dotenv opts)]
+    (or (non-blank (:base-url opts))
+        (non-blank (get env url-env-var))
+        (non-blank (get dotenv url-env-var)))))
+
+(defn resolve-default-forge
+  "Resolves the default forge: NIXBOT_CLI_DEFAULT_FORGE (env or .env), else github."
+  [opts]
+  (let [{:keys [env dotenv]} (env-and-dotenv opts)]
+    (or (non-blank (get env default-forge-env-var))
+        (non-blank (get dotenv default-forge-env-var))
+        "github")))
+(ns nixbot-cli.api
+  (:require
+   [babashka.http-client :as http]
+   [cheshire.core :as json]
+   [clojure.string :as str])
+  (:import
+   [java.net URLEncoder]))
+
+(defn- trim-trailing-slashes [s]
+  (str/replace (or s "") #"/+$" ""))
+
+(defn- encode-segment [s]
+  (-> (URLEncoder/encode (str s) "UTF-8")
+      (str/replace "+" "%20")))
+
+(defn- encode-attr
+  "Attribute names may contain slashes; the server routes them with a
+  path-converter, so slashes stay literal while the rest is encoded."
+  [attr]
+  (->> (str/split (str attr) #"/" -1)
+       (map encode-segment)
+       (str/join "/")))
+
+(defn url [base-url path]
+  (str (trim-trailing-slashes base-url) path))
+
+(defn- query-string [params]
+  (let [pairs (for [[k v] params
+                    :when (some? v)]
+                (str (name k) "=" (encode-segment v)))]
+    (when (seq pairs)
+      (str "?" (str/join "&" pairs)))))
+
+(defn- success-status? [status]
+  (<= 200 (long status) 299))
+
+(defn- parse-json-body [body]
+  (when-not (str/blank? body)
+    (json/parse-string body true)))
+
+(defn request!
+  ([client method path]
+   (request! client method path {}))
+  ([{:keys [base-url token request-fn]
+     :or   {request-fn http/request}}
+    method
+    path
+    opts]
+   (let [default-headers (cond-> {"Accept" "application/json"}
+                           (not (str/blank? token))
+                           (assoc "Authorization" (str "Bearer " token)))
+         headers         (merge default-headers (:headers opts))
+         req             (merge {:method  method
+                                 :uri     (url base-url path)
+                                 :headers headers
+                                 :throw   false}
+                                (dissoc opts :headers))
+         resp            (request-fn req)
+         status          (:status resp)]
+     (if (success-status? status)
+       resp
+       (let [detail (or (:detail (try (parse-json-body (:body resp))
+                                      (catch Exception _ nil)))
+                        (some-> (:body resp) str/trim not-empty))]
+         (throw (ex-info (str "Nixbot API request failed with HTTP " status
+                              (when detail (str ": " detail))
+                              " (" (:uri req) ")")
+                         {:type   :nixbot-cli.api/http-error
+                          :status status
+                          :body   (:body resp)
+                          :uri    (:uri req)})))))))
+
+(defn- repo-path [{:keys [forge owner name]}]
+  (str "/api/repos/" (encode-segment forge)
+       "/" (encode-segment owner)
+       "/" (encode-segment name)))
+
+(defn fetch-repos! [client]
+  (-> (request! client :get "/api/repos")
+      :body
+      parse-json-body))
+
+(defn fetch-repo! [client repo]
+  (-> (request! client :get (repo-path repo))
+      :body
+      parse-json-body))
+
+(defn fetch-builds!
+  "One page of builds. `params` supports :page :status :branch :pr_number :commit."
+  [client repo params]
+  (-> (request! client :get (str (repo-path repo) "/builds" (query-string params)))
+      :body
+      parse-json-body))
+
+(defn fetch-build! [client repo number]
+  (-> (request! client :get (str (repo-path repo) "/builds/" number))
+      :body
+      parse-json-body))
+
+(defn fetch-failures! [client repo number {:keys [tail]}]
+  (-> (request! client :get (str (repo-path repo) "/builds/" number "/failures"
+                                 (query-string {:tail tail})))
+      :body
+      parse-json-body))
+
+(defn fetch-attr-history! [client repo attr]
+  (-> (request! client :get (str (repo-path repo) "/attrs/" (encode-attr attr)))
+      :body
+      parse-json-body))
+
+(defn fetch-queue! [client]
+  (-> (request! client :get "/api/queue")
+      :body
+      parse-json-body))
+
+(defn restart-build! [client repo number]
+  (-> (request! client :post (str (repo-path repo) "/builds/" number "/restart"))
+      :body
+      parse-json-body))
+
+(defn cancel-build! [client repo number]
+  (-> (request! client :post (str (repo-path repo) "/builds/" number "/cancel"))
+      :body
+      parse-json-body))
+
+(defn set-enabled! [client repo enabled?]
+  (-> (request! client :post (str (repo-path repo) (if enabled? "/enable" "/disable")))
+      :body
+      parse-json-body))
+
+(defn fetch-log!
+  "Raw plain-text log of one attribute of a build. The raw log route lives
+  outside /api. `:tail` limits output to the last N lines."
+  [client {:keys [forge owner name]} number attr {:keys [tail]}]
+  (:body (request! client :get
+                   (str "/repos/" (encode-segment forge)
+                        "/" (encode-segment owner)
+                        "/" (encode-segment name)
+                        "/builds/" number
+                        "/logs/raw/" (encode-attr attr)
+                        (query-string {:tail tail}))
+                   {:headers {"Accept" "text/plain"}})))
+(ns nixbot-cli.core
+  (:require
+   [babashka.cli :as cli]
+   [clojure.string :as str]
+   [nixbot-cli.api :as api]
+   [nixbot-cli.auth :as auth]
+   [nixbot-cli.builds :as builds]
+   [nixbot-cli.format :as fmt]
+   [nixbot-cli.repo :as repo])
+  (:gen-class))
+
+(def cli-config
+  {:spec      {:base-url    {:desc "Nixbot instance URL (defaults to NIXBOT_URL)"
+                             :ref  "<url>"}
+               :format      {:desc     "Output format: human, plain, json, edn"
+                             :ref      "<format>"
+                             :coerce   :keyword
+                             :validate #{:human :plain :json :edn}}
+               :json        {:desc   "Output JSON"
+                             :coerce :boolean}
+               :edn         {:desc   "Output EDN"
+                             :coerce :boolean}
+               :plain       {:desc   "Output plain text"
+                             :coerce :boolean}
+               :repo        {:desc "Select repository: [FORGE/]OWNER/REPO"
+                             :ref  "<repo>"}
+               :status      {:desc "Filter builds by status"
+                             :ref  "<status>"}
+               :branch      {:desc "Filter builds by branch"
+                             :ref  "<branch>"}
+               :pr          {:desc   "Filter builds by PR number"
+                             :ref    "<n>"
+                             :coerce :long}
+               :commit      {:desc "Filter builds by commit SHA prefix"
+                             :ref  "<sha>"}
+               :limit       {:desc   "Maximum number of items to fetch"
+                             :ref    "<n>"
+                             :coerce :long}
+               :page        {:desc   "Fetch a single page of builds"
+                             :ref    "<n>"
+                             :coerce :long}
+               :tail        {:desc   "Limit logs to the last N lines"
+                             :ref    "<n>"
+                             :coerce :long}
+               :compact     {:desc   "Show only compact watch output"
+                             :coerce :boolean}
+               :exit-status {:desc   "Exit with non-zero status if the watched build fails"
+                             :coerce :boolean}
+               :interval    {:desc   "Refresh interval in seconds"
+                             :ref    "<seconds>"
+                             :coerce :long}
+               :help        {:desc   "Show help"
+                             :alias  :h
+                             :coerce :boolean}}
+   :exec-args {:format   :human
+               :limit    20
+               :interval 3}
+   :alias     {:R :repo
+               :L :limit
+               :s :status
+               :i :interval}
+   :restrict  true})
+
+(defn usage-error [message]
+  (throw (ex-info message {:type :nixbot-cli.core/usage-error})))
+
+(def commands
+  #{"help" "repos" "builds" "queue" "build" "failures" "attr" "logs"
+    "watch" "restart" "cancel" "enable" "disable"})
+
+(def value-options
+  #{"--base-url" "--format" "--repo" "-R" "--status" "-s" "--branch"
+    "--pr" "--commit" "--limit" "-L" "--page" "--tail" "--interval" "-i"})
+
+(defn- find-command-index [argv]
+  (loop [i 0]
+    (when (< i (count argv))
+      (let [arg (nth argv i)]
+        (cond
+          (contains? commands arg) i
+          (contains? value-options arg) (recur (+ i 2))
+          (and (str/starts-with? arg "--") (str/includes? arg "=")) (recur (inc i))
+          :else (recur (inc i)))))))
+
+(defn- normalize-argv [argv]
+  (let [argv (vec argv)
+        idx  (find-command-index argv)]
+    (if (and idx (pos? idx))
+      (vec (concat [(nth argv idx)]
+                   (subvec argv (inc idx))
+                   (subvec argv 0 idx)))
+      argv)))
+
+(defn- normalize-format [opts]
+  (let [format (cond
+                 (:json opts) :json
+                 (:edn opts) :edn
+                 (:plain opts) :plain
+                 :else (:format opts))]
+    (-> opts
+        (assoc :format (if (keyword? format) format (keyword format)))
+        (dissoc :json :edn :plain))))
+
+(defn- parse-build-number [s context]
+  (when-not (str/blank? s)
+    (or (parse-long (str/replace s #"^#" ""))
+        (usage-error (str context " must be a build number, got: " s)))))
+
+(defn parse-command [argv]
+  (let [argv                   (normalize-argv argv)
+        {:keys [opts args]}    (cli/parse-args argv cli-config)
+        [command & positional] args
+        opts                   (normalize-format opts)]
+    (case command
+      nil (assoc opts :command :help)
+      "help" (assoc opts :command :help)
+      "repos" (assoc opts :command :repos)
+      "builds" (assoc opts :command :builds)
+      "queue" (assoc opts :command :queue)
+      "build" (assoc opts :command :build
+                     :number (parse-build-number (first positional) "build"))
+      "failures" (assoc opts :command :failures
+                        :number (parse-build-number (first positional) "failures"))
+      "attr" (let [attr (first positional)]
+               (when (str/blank? attr)
+                 (usage-error "attr requires an attribute name"))
+               (assoc opts :command :attr :attr attr))
+      "logs" (let [[number attr] positional]
+               (when (str/blank? number)
+                 (usage-error "logs requires a build number and an attribute name"))
+               (when (str/blank? attr)
+                 (usage-error "logs requires an attribute name"))
+               (assoc opts :command :logs
+                      :number (parse-build-number number "logs")
+                      :attr attr))
+      "watch" (assoc opts :command :watch
+                     :number (parse-build-number (first positional) "watch"))
+      "restart" (let [number (parse-build-number (first positional) "restart")]
+                  (when-not number
+                    (usage-error "restart requires a build number"))
+                  (assoc opts :command :restart :number number))
+      "cancel" (let [number (parse-build-number (first positional) "cancel")]
+                 (when-not number
+                   (usage-error "cancel requires a build number"))
+                 (assoc opts :command :cancel :number number))
+      "enable" (assoc opts :command :enable)
+      "disable" (assoc opts :command :disable)
+      (usage-error (str "unknown command: " command)))))
+
+(defn help-text []
+  (str/join
+   "\n"
+   ["nixbot-cli - inspect and control Nixbot CI builds"
+    ""
+    "Usage:"
+    "  nixbot-cli repos"
+    "  nixbot-cli builds [-R REPO] [--status STATUS] [--branch BRANCH] [--pr N] [--commit SHA] [--limit N | --page N]"
+    "  nixbot-cli queue"
+    "  nixbot-cli build [number] [-R REPO]"
+    "  nixbot-cli failures [number] [-R REPO] [--tail N]"
+    "  nixbot-cli attr <attribute> [-R REPO] [--limit N]"
+    "  nixbot-cli logs <number> <attribute> [-R REPO] [--tail N]"
+    "  nixbot-cli watch [number] [-R REPO] [--compact] [--exit-status] [--interval N]"
+    "  nixbot-cli restart <number> [-R REPO]"
+    "  nixbot-cli cancel <number> [-R REPO]"
+    "  nixbot-cli enable [-R REPO]"
+    "  nixbot-cli disable [-R REPO]"
+    ""
+    "REPO is [FORGE/]OWNER/REPO; without -R the repo is detected from the local"
+    "git checkout. The default forge is github (override: NIXBOT_CLI_DEFAULT_FORGE)."
+    ""
+    "Environment:"
+    "  NIXBOT_URL                Nixbot instance URL"
+    "  NIXBOT_API_TOKEN          API token"
+    "  NIXBOT_API_TOKEN_COMMAND  Command printing the API token to stdout"
+    ""
+    "Options:"
+    (cli/format-opts cli-config)]))
+
+(defn- client [opts]
+  (let [base-url (auth/resolve-base-url opts)]
+    (when (str/blank? base-url)
+      (usage-error "Nixbot instance URL is required. Set NIXBOT_URL or pass --base-url."))
+    {:base-url base-url
+     :token    (auth/resolve-token opts)}))
+
+(defn- target-repo [parsed]
+  (repo/resolve-repo (:repo parsed)
+                     {:default-forge (auth/resolve-default-forge parsed)}))
+
+(defn- build-filters [parsed]
+  {:status    (builds/normalize-status (:status parsed))
+   :branch    (:branch parsed)
+   :pr_number (:pr parsed)
+   :commit    (:commit parsed)})
+
+(defn- latest-build-number! [client repo]
+  (let [{:keys [items]} (api/fetch-builds! client repo {:page 1})]
+    (or (some-> items first :number)
+        (usage-error (str "No builds found for " (:slug repo))))))
+
+(defn- resolve-number! [parsed client repo]
+  (or (:number parsed)
+      (latest-build-number! client repo)))
+
+(defn- list-builds! [parsed client repo]
+  (let [filters (build-filters parsed)
+        items   (if (:page parsed)
+                  (:items (api/fetch-builds! client repo (assoc filters :page (:page parsed))))
+                  (builds/fetch-up-to
+                   #(api/fetch-builds! client repo (assoc filters :page %))
+                   (:limit parsed)))
+        data    {:repo repo :items (vec items)}]
+    (println (fmt/format-builds data (:format parsed)))
+    data))
+
+(defn- build-detail! [client repo number]
+  (let [{:keys [build attributes]} (api/fetch-build! client repo number)]
+    {:repo repo :build build :attributes (vec attributes)}))
+
+(defn- watch! [parsed client repo]
+  (let [number (resolve-number! parsed client repo)
+        mode   (if (:compact parsed) :compact (:format parsed))]
+    (loop []
+      (let [data (build-detail! client repo number)]
+        (println (fmt/format-watch data mode))
+        (flush)
+        (if (builds/terminal? (:build data))
+          {:data      data
+           :exit-code (if (:exit-status parsed) (builds/exit-code (:build data)) 0)}
+          (do
+            (Thread/sleep (* 1000 (:interval parsed)))
+            (recur)))))))
+
+(defn execute! [parsed]
+  (case (:command parsed)
+    :help (do (println (help-text)) nil)
+    :repos (let [client (client parsed)
+                 repos  (api/fetch-repos! client)]
+             (println (fmt/format-repos repos (:format parsed)))
+             repos)
+    :queue (let [client  (client parsed)
+                 entries (api/fetch-queue! client)]
+             (println (fmt/format-queue entries (:format parsed)))
+             entries)
+    :builds (list-builds! parsed (client parsed) (target-repo parsed))
+    :build (let [client (client parsed)
+                 repo   (target-repo parsed)
+                 data   (build-detail! client repo (resolve-number! parsed client repo))]
+             (println (fmt/format-build data (:format parsed)))
+             data)
+    :failures (let [client  (client parsed)
+                    repo    (target-repo parsed)
+                    number  (resolve-number! parsed client repo)
+                    summary (api/fetch-failures! client repo number {:tail (:tail parsed)})
+                    data    {:repo repo :number number :summary summary}]
+                (println (fmt/format-failures data (:format parsed)))
+                data)
+    :attr (let [client  (client parsed)
+                repo    (target-repo parsed)
+                entries (->> (api/fetch-attr-history! client repo (:attr parsed))
+                             (take (:limit parsed))
+                             vec)
+                data    {:repo repo :attr (:attr parsed) :entries entries}]
+            (println (fmt/format-attr-history data (:format parsed)))
+            data)
+    :logs (let [client (client parsed)
+                repo   (target-repo parsed)
+                logs   (api/fetch-log! client repo (:number parsed) (:attr parsed)
+                                       {:tail (:tail parsed)})]
+            (println logs)
+            logs)
+    :watch (watch! parsed (client parsed) (target-repo parsed))
+    :restart (let [client (client parsed)
+                   repo   (target-repo parsed)
+                   result (api/restart-build! client repo (:number parsed))]
+               (println (fmt/format-action result (:format parsed)))
+               result)
+    :cancel (let [client (client parsed)
+                  repo   (target-repo parsed)
+                  result (api/cancel-build! client repo (:number parsed))]
+              (println (fmt/format-action result (:format parsed)))
+              result)
+    :enable (let [client (client parsed)
+                  repo   (target-repo parsed)
+                  result (api/set-enabled! client repo true)]
+              (println (fmt/format-enabled result (:format parsed)))
+              result)
+    :disable (let [client (client parsed)
+                   repo   (target-repo parsed)
+                   result (api/set-enabled! client repo false)]
+               (println (fmt/format-enabled result (:format parsed)))
+               result)))
+
+(defn -main [& args]
+  (try
+    (let [result (execute! (parse-command args))]
+      (when (and (map? result) (pos? (or (:exit-code result) 0)))
+        (System/exit (:exit-code result))))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (ex-message e)))
+      (System/exit 1))))
+(ns user (:require [nixbot-cli.core])) (apply nixbot-cli.core/-main *command-line-args*)

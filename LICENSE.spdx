@@ -1,0 +1,6 @@
+SPDXVersion: SPDX-2.1
+DataLicense: CC0-1.0
+PackageName: nixbot-cli
+PackageOriginator: Casey Link <unnamedrambler@gmail.com>
+PackageHomePage: https://github.com/outskirtslabs/nixbot-cli
+PackageLicenseDeclared: EUPL-1.2

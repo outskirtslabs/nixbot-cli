@@ -1,0 +1,54 @@
+{:paths    ["src"]
+ :bbin/bin {nixbot-cli {:main-opts ["-m" "nixbot-cli.core"]}}
+ :tasks    {:requires
+            ([clojure.string :as str]
+             [babashka.fs :as fs]
+             [babashka.tasks :refer [shell]])
+
+            :init
+            (do (def paths ["src" "test"]))
+
+            dev
+            {:doc  "Start a babashka nREPL server"
+             :task (shell "bb --classpath src:test:dev nrepl-server")}
+
+            test
+            {:doc  "Run all tests under babashka"
+             :task (apply shell "bb --classpath src:test -m nixbot-cli.test-runner" *command-line-args*)}
+
+            fmt
+            {:doc  "Format code with cljfmt"
+             :task (apply shell "cljfmt --quiet -v fix" (if (seq *command-line-args*) *command-line-args* paths))}
+
+            fmt:check
+            {:doc  "Check code formatting without making changes"
+             :task (apply shell "cljfmt check " paths)}
+
+            lint:copy-configs
+            {:doc  "Copy clj-kondo configs from dependencies"
+             :task (shell "clj-kondo" "--lint" (-> (shell {:out :string} "clojure -Spath -A:test:dev") :out str/trim) "--dependencies" "--copy-configs" "--skip-lint")}
+
+            lint
+            {:doc  "Lint code with clj-kondo"
+             :task (if (seq *command-line-args*)
+                     (apply shell "clj-kondo" "--lint" *command-line-args*)
+                     (apply shell "clj-kondo --lint" paths))}
+
+            qa
+            {:doc     "Run full quality assurance: format, lint, and test"
+             :depends [fmt lint test]}
+
+            ci
+            {:doc     "Run CI checks: test, format check, and lint"
+             :depends [test fmt:check lint]}
+
+            build
+            {:doc  "Generate the nixbot-cli uberscript"
+             :task (do
+                     (println "Building uberscript...")
+                     (fs/delete-if-exists "nixbot-cli")
+                     (shell "bb uberscript nixbot-cli -m nixbot-cli.core")
+                     (let [content (slurp "nixbot-cli")]
+                       (spit "nixbot-cli" (str "#!/usr/bin/env bb\n" content)))
+                     (shell "chmod +x nixbot-cli")
+                     (println "Done. Generated: nixbot-cli"))}}}
