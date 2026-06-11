@@ -40,6 +40,30 @@
     (is (str/includes? out "Builds for github/outskirtslabs/nixbot-cli"))
     (is (str/includes? out "#7  [FAIL] failed  main  f54be57a  PR#12"))))
 
+(deftest format-builds-nests-failed-attrs-as-a-tree
+  (let [items [(assoc build :failed_attrs
+                      [{:attr "x86_64-linux.a" :status "failed"}
+                       {:attr "x86_64-linux.b" :status "dependency_failed"}])]]
+    (testing "human output uses tree branches"
+      (let [out (fmt/format-builds {:repo repo :items items} :human)]
+        (is (str/includes? out "    ├─ x86_64-linux.a  [FAIL] failed"))
+        (is (str/includes? out "    └─ x86_64-linux.b  [FAIL] dependency_failed"))))
+    (testing "plain output indents without tree characters"
+      (let [out (fmt/format-builds {:repo repo :items items} :plain)]
+        (is (str/includes? out "    x86_64-linux.a  [FAIL] failed"))
+        (is (not (str/includes? out "└─")))))
+    (testing "machine output nests the attributes in each item"
+      (is (= "x86_64-linux.a"
+             (get-in (json/parse-string (fmt/format-builds {:repo repo :items items} :json) true)
+                     [:items 0 :failed_attrs 0 :attr]))))))
+
+(deftest format-attr-listing-shows-attributes-and-hint
+  (let [out (fmt/format-attr-listing {:repo repo :build build :attributes attributes} :human)]
+    (is (str/includes? out "Attributes for build #7 (github/outskirtslabs/nixbot-cli):"))
+    (is (str/includes? out "  x86_64-linux.ok  [OK] succeeded"))
+    (is (str/includes? out "  x86_64-linux.bad  [FAIL] failed"))
+    (is (str/includes? out "Fetch logs with: nixbot-cli logs 7 <attribute> -R github/outskirtslabs/nixbot-cli"))))
+
 (deftest format-queue-handles-empty-and-running-entries
   (is (= "Queue is empty" (fmt/format-queue [] :human)))
   (let [out (fmt/format-queue

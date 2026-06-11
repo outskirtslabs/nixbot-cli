@@ -141,6 +141,16 @@ The default forge is `github`; override it with `NIXBOT_CLI_DEFAULT_FORGE` or by
 ./nixbot-cli builds --branch main --pr 12 --commit f54be57a
 ```
 
+Failed builds show their failed attributes nested underneath (in json/edn output they appear as a `failed_attrs` vector on each item):
+
+```text
+Builds for github/outskirtslabs/llx
+#3  [OK] succeeded  main  ea558cd4  2026-06-11T07:41:29.816753Z
+#2  [FAIL] failed  main  7440c727  PR#1  2026-06-10T15:40:39.555190Z
+    ├─ x86_64-linux.cljs  [FAIL] failed
+    └─ x86_64-linux.tests  [FAIL] failed
+```
+
 ### View a build
 
 ```bash
@@ -174,6 +184,9 @@ One request answering "why did this build fail?" — failed attributes with erro
 
 # Only the last 100 lines
 ./nixbot-cli logs 7 x86_64-linux.tests --tail 100
+
+# Without an attribute: list the build's attributes to pick from
+./nixbot-cli logs 7
 ```
 
 ### Watch a build

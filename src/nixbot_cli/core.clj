@@ -127,12 +127,10 @@
                (assoc opts :command :attr :attr attr))
       "logs" (let [[number attr] positional]
                (when (str/blank? number)
-                 (usage-error "logs requires a build number and an attribute name"))
-               (when (str/blank? attr)
-                 (usage-error "logs requires an attribute name"))
+                 (usage-error "logs requires a build number"))
                (assoc opts :command :logs
                       :number (parse-build-number number "logs")
-                      :attr attr))
+                      :attr (when-not (str/blank? attr) attr)))
       "watch" (assoc opts :command :watch
                      :number (parse-build-number (first positional) "watch"))
       "restart" (let [number (parse-build-number (first positional) "restart")]
@@ -159,7 +157,7 @@
     "  nixbot-cli build [number] [-R REPO]"
     "  nixbot-cli failures [number] [-R REPO] [--tail N]"
     "  nixbot-cli attr <attribute> [-R REPO] [--limit N]"
-    "  nixbot-cli logs <number> <attribute> [-R REPO] [--tail N]"
+    "  nixbot-cli logs <number> [attribute] [-R REPO] [--tail N]"
     "  nixbot-cli watch [number] [-R REPO] [--compact] [--exit-status] [--interval N]"
     "  nixbot-cli restart <number> [-R REPO]"
     "  nixbot-cli cancel <number> [-R REPO]"
@@ -203,6 +201,22 @@
   (or (:number parsed)
       (latest-build-number! client repo)))
 
+;; Builds in these states can have failed attributes worth surfacing.
+(def ^:private failed-attr-statuses #{"failed" "building"})
+
+(defn- with-failed-attrs
+  "Nests each failed/building build's failed attributes under :failed_attrs
+  (one extra request per such build)."
+  [client repo items]
+  (mapv (fn [item]
+          (if (contains? failed-attr-statuses (str (builds/field item :status)))
+            (let [{:keys [attributes]} (api/fetch-build! client repo (builds/field item :number))
+                  failed               (filterv builds/failed-attr? attributes)]
+              (cond-> item
+                (seq failed) (assoc :failed_attrs failed)))
+            item))
+        items))
+
 (defn- list-builds! [parsed client repo]
   (let [filters (build-filters parsed)
         items   (if (:page parsed)
@@ -210,7 +224,8 @@
                   (builds/fetch-up-to
                    #(api/fetch-builds! client repo (assoc filters :page %))
                    (:limit parsed)))
-        data    {:repo repo :items (vec items)}]
+        items   (with-failed-attrs client repo (vec items))
+        data    {:repo repo :items items}]
     (println (fmt/format-builds data (:format parsed)))
     data))
 
@@ -265,11 +280,16 @@
             (println (fmt/format-attr-history data (:format parsed)))
             data)
     :logs (let [client (client parsed)
-                repo   (target-repo parsed)
-                logs   (api/fetch-log! client repo (:number parsed) (:attr parsed)
-                                       {:tail (:tail parsed)})]
-            (println logs)
-            logs)
+                repo   (target-repo parsed)]
+            (if (:attr parsed)
+              (let [logs (api/fetch-log! client repo (:number parsed) (:attr parsed)
+                                         {:tail (:tail parsed)})]
+                (println logs)
+                logs)
+              ;; No attribute given: list the build's attributes instead.
+              (let [data (build-detail! client repo (:number parsed))]
+                (println (fmt/format-attr-listing data (:format parsed)))
+                data)))
     :watch (watch! parsed (client parsed) (target-repo parsed))
     :restart (let [client (client parsed)
                    repo   (target-repo parsed)

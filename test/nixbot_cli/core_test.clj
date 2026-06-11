@@ -36,16 +36,18 @@
     (is (thrown-with-msg? Exception #"must be a build number"
                           (core/parse-command ["build" "not-a-number"])))))
 
-(deftest parse-command-logs-requires-number-and-attr
+(deftest parse-command-logs-requires-number-attr-is-optional
   (let [parsed (core/parse-command ["logs" "42" "x86_64-linux.tests" "--tail" "10"])]
     (is (= :logs (:command parsed)))
     (is (= 42 (:number parsed)))
     (is (= "x86_64-linux.tests" (:attr parsed)))
     (is (= 10 (:tail parsed))))
+  (testing "without an attribute the command lists the build's attributes"
+    (let [parsed (core/parse-command ["logs" "42"])]
+      (is (= :logs (:command parsed)))
+      (is (nil? (:attr parsed)))))
   (is (thrown-with-msg? Exception #"logs requires"
-                        (core/parse-command ["logs"])))
-  (is (thrown-with-msg? Exception #"attribute name"
-                        (core/parse-command ["logs" "42"]))))
+                        (core/parse-command ["logs"]))))
 
 (deftest parse-command-attr-requires-attribute
   (is (= "checks.default" (:attr (core/parse-command ["attr" "checks.default"]))))

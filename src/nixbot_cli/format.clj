@@ -74,12 +74,26 @@
        (when-let [pr (field build :pr_number)] (str "  PR#" pr))
        "  " (field build :created_at)))
 
+(defn- failed-attr-tree [build tree?]
+  (let [failed (vec (field build :failed_attrs))
+        last-i (dec (count failed))]
+    (map-indexed
+     (fn [i attribute]
+       (str "    "
+            (when tree? (if (= i last-i) "└─ " "├─ "))
+            (field attribute :attr)
+            "  " (status-label (field attribute :status))))
+     failed)))
+
 (defn format-builds [{:keys [repo items]} output-format]
   (or (machine {:repo (:slug repo) :items items} output-format)
       (if (seq items)
         (str/join "\n"
                   (cons (str "Builds for " (:slug repo))
-                        (map build-row items)))
+                        (mapcat (fn [build]
+                                  (cons (build-row build)
+                                        (failed-attr-tree build (not= output-format :plain))))
+                                items)))
         (str "No builds found for " (:slug repo)))))
 
 ;; --- queue ---
@@ -216,6 +230,22 @@
                   (cons (str "History for " attr " in " (:slug repo))
                         (map history-row entries)))
         (str "No history for " attr " in " (:slug repo)))))
+
+;; --- attribute listing (logs without an attribute) ---
+
+(defn format-attr-listing [{:keys [repo build attributes]} output-format]
+  (or (machine {:build build :attributes attributes} output-format)
+      (str/join "\n"
+                (concat
+                 [(str "Attributes for build #" (field build :number)
+                       " (" (:slug repo) "):")]
+                 (map (fn [attribute]
+                        (str "  " (field attribute :attr)
+                             "  " (status-label (field attribute :status))))
+                      attributes)
+                 [""
+                  (str "Fetch logs with: nixbot-cli logs " (field build :number)
+                       " <attribute> -R " (:slug repo))]))))
 
 ;; --- watch ---
 
